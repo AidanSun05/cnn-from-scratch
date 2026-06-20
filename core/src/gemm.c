@@ -31,30 +31,36 @@ void gemmCleanup(void) {
 
 static inline void packA(const float* restrict a, float* restrict ap, bool at, int pc, int ic, int pmax, int imax,
     int lda) {
-    for (int p = 0; p < pmax; p++) {
-        float* dst = ap + p * MC;
-        if (at) {
-            const float* src = a + (pc + p) * lda + ic;
-            memcpy(dst, src, imax * sizeof(float));
-        } else {
-            for (int i = 0; i < imax; i++) {
-                dst[i] = a[(ic + i) * lda + pc + p];
+    for (int ir = 0; ir < imax; ir += MR) {
+        const int irmax = min(imax - ir, MR);
+        float* dst = ap + ir * pmax;
+        for (int p = 0; p < pmax; p++) {
+            float* d = dst + p * MR;
+            if (at) {
+                const float* src = a + (pc + p) * lda + ic + ir;
+                memcpy(d, src, irmax * sizeof(float));
+            } else {
+                for (int i = 0; i < irmax; i++) d[i] = a[(ic + ir + i) * lda + pc + p];
             }
+            for (int i = irmax; i < MR; i++) d[i] = 0.0f; // pad
         }
     }
 }
 
 static inline void packB(const float* restrict b, float* restrict bp, bool bt, int jc, int pc, int jmax, int pmax,
     int ldb) {
-    for (int p = 0; p < pmax; p++) {
-        float* dst = bp + p * NC;
-        if (bt) {
-            for (int j = 0; j < jmax; j++) {
-                dst[j] = b[(jc + j) * ldb + pc + p];
+    for (int jr = 0; jr < jmax; jr += NR) {
+        const int jrmax = min(jmax - jr, NR);
+        float* dst = bp + jr * pmax;
+        for (int p = 0; p < pmax; p++) {
+            float* d = dst + p * NR;
+            if (bt) {
+                for (int j = 0; j < jrmax; j++) d[j] = b[(jc + jr + j) * ldb + pc + p];
+            } else {
+                const float* src = b + (pc + p) * ldb + jc + jr;
+                memcpy(d, src, jrmax * sizeof(float));
             }
-        } else {
-            const float* src = b + (pc + p) * ldb + jc;
-            memcpy(dst, src, jmax * sizeof(float));
+            for (int j = jrmax; j < NR; j++) d[j] = 0.0f; // pad
         }
     }
 }
@@ -89,42 +95,18 @@ static inline void microkernel(const float* restrict ap, const float* restrict b
     }
 
     for (int p = 0; p < pmax; ++p) {
-        const float* arow = ap + p * MC;
-        const float* brow = bp + p * NC; // length >= jrmax
+        const float* arow = ap + p * MR;
+        const float* brow = bp + p * NR; // length >= jrmax
         __m256 b = _mm256_loadu_ps(brow); // 8 floats (jrmax <= 8)
 
-        if (irmax > 0) {
-            __m256 a = _mm256_broadcast_ss(arow + 0);
-            c0 = _mm256_fmadd_ps(a, b, c0);
-        }
-        if (irmax > 1) {
-            __m256 a = _mm256_broadcast_ss(arow + 1);
-            c1 = _mm256_fmadd_ps(a, b, c1);
-        }
-        if (irmax > 2) {
-            __m256 a = _mm256_broadcast_ss(arow + 2);
-            c2 = _mm256_fmadd_ps(a, b, c2);
-        }
-        if (irmax > 3) {
-            __m256 a = _mm256_broadcast_ss(arow + 3);
-            c3 = _mm256_fmadd_ps(a, b, c3);
-        }
-        if (irmax > 4) {
-            __m256 a = _mm256_broadcast_ss(arow + 4);
-            c4 = _mm256_fmadd_ps(a, b, c4);
-        }
-        if (irmax > 5) {
-            __m256 a = _mm256_broadcast_ss(arow + 5);
-            c5 = _mm256_fmadd_ps(a, b, c5);
-        }
-        if (irmax > 6) {
-            __m256 a = _mm256_broadcast_ss(arow + 6);
-            c6 = _mm256_fmadd_ps(a, b, c6);
-        }
-        if (irmax > 7) {
-            __m256 a = _mm256_broadcast_ss(arow + 7);
-            c7 = _mm256_fmadd_ps(a, b, c7);
-        }
+        if (irmax > 0) c0 = _mm256_fmadd_ps(_mm256_broadcast_ss(arow + 0), b, c0);
+        if (irmax > 1) c1 = _mm256_fmadd_ps(_mm256_broadcast_ss(arow + 1), b, c1);
+        if (irmax > 2) c2 = _mm256_fmadd_ps(_mm256_broadcast_ss(arow + 2), b, c2);
+        if (irmax > 3) c3 = _mm256_fmadd_ps(_mm256_broadcast_ss(arow + 3), b, c3);
+        if (irmax > 4) c4 = _mm256_fmadd_ps(_mm256_broadcast_ss(arow + 4), b, c4);
+        if (irmax > 5) c5 = _mm256_fmadd_ps(_mm256_broadcast_ss(arow + 5), b, c5);
+        if (irmax > 6) c6 = _mm256_fmadd_ps(_mm256_broadcast_ss(arow + 6), b, c6);
+        if (irmax > 7) c7 = _mm256_fmadd_ps(_mm256_broadcast_ss(arow + 7), b, c7);
     }
 
     // Write back
@@ -173,14 +155,13 @@ void multiply(const float* restrict a, const float* restrict b, float* restrict 
                     const int imax = min(m - ic, MC);
                     packA(a, ap, at, pc, ic, pmax, imax, lda);
 
-                    for (int jr = 0; jr < jmax; jr += NR) {
+                    for (int jr = 0, jt = 0; jr < jmax; jr += NR, jt++) {
                         const int jrmax = min(jmax - jr, NR);
-                        const float* bp0 = bp + jr;
-                        for (int ir = 0; ir < imax; ir += MR) {
+                        const float* bp0 = bp + jt * pmax * NR; // jump to NR-panel jt
+                        for (int ir = 0, it = 0; ir < imax; ir += MR, it++) {
                             const int irmax = min(imax - ir, MR);
-                            const float* ap0 = ap + ir;
+                            const float* ap0 = ap + it * pmax * MR; // jump to MR-panel it
                             float* cblk = c + (ic + ir) * n + (jc + jr);
-
                             microkernel(ap0, bp0, cblk, n, jrmax, pmax, irmax, firstK);
                         }
                     }
