@@ -1,0 +1,11 @@
+[package]
+name = "example_mnist_rust"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[build-dependencies]
+bindgen = "0.72.1"
+
+[dependencies]
+image = "0.25.10"
